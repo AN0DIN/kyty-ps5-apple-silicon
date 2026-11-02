@@ -155,8 +155,7 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 
 bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
 	return replacement != InstructionReplacement::None &&
-	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
-	        replacement == InstructionReplacement::ReadProcessorId);
+	       (trap_replacements || replacement == InstructionReplacement::ReadProcessorId);
 }
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -922,6 +921,56 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
 }
 
+// INSERTQ: bits [length-1:0] of the source's low quadword replace bits [index+length-1:index] of
+// the destination's low quadword; the upper destination quadword is kept, like the emulator does.
+// A zero length means 64. Bits shifted past bit 63 are dropped, which matches the emulator's
+// clamping of length to 64 - index.
+void GenerateInsertQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& generator) {
+	const Xbyak::Xmm destination(decoded.operands[0].reg.value - ZYDIS_REGISTER_XMM0);
+	const Xbyak::Xmm source(decoded.operands[1].reg.value - ZYDIS_REGISTER_XMM0);
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.pushfq();
+	generator.push(rax);
+	generator.push(rcx);
+	generator.push(rdx);
+	if (decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+		const u32 length = decoded.operands[2].imm.value.u & 63u;
+		const u32 index  = decoded.operands[3].imm.value.u & 63u;
+		const u64 mask   = length == 0 ? UINT64_MAX : (u64 {1} << length) - 1;
+		generator.movq(rax, source);
+		generator.mov(rdx, mask);
+		generator.and_(rax, rdx);
+		if (index != 0) {
+			generator.shl(rax, index);
+		}
+		generator.mov(rdx, ~(mask << index));
+	} else {
+		// Controls live in the source's upper quadword: length in bits [5:0], index in [13:8].
+		generator.pextrq(rax, source, 1);
+		generator.mov(ecx, eax);
+		generator.neg(ecx);
+		generator.mov(rdx, UINT64_MAX);
+		// CL shifts use six bits: -length gives 64-length, with zero retaining all 64 bits.
+		generator.shr(rdx, cl);
+		generator.shr(eax, 8);
+		generator.mov(ecx, eax);
+		generator.movq(rax, source);
+		generator.and_(rax, rdx);
+		generator.shl(rax, cl);
+		generator.shl(rdx, cl);
+		generator.not_(rdx);
+	}
+	generator.movq(rcx, destination);
+	generator.and_(rcx, rdx);
+	generator.or_(rcx, rax);
+	generator.pinsrq(destination, rcx, 0);
+	generator.pop(rdx);
+	generator.pop(rcx);
+	generator.pop(rax);
+	generator.popfq();
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
@@ -1054,6 +1103,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 						GenerateReciprocalSquareRoot(*decoded, generator);
 					} else if (replacement == InstructionReplacement::ExtractQ) {
 						GenerateExtractQ(*decoded, generator);
+					} else if (replacement == InstructionReplacement::InsertQ) {
+						GenerateInsertQ(*decoded, generator);
 					} else {
 						// CLFLUSH writes back dirty data too; invalidation is a permitted stronger
 						// action.
