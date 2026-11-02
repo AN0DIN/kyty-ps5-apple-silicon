@@ -329,8 +329,7 @@ PatchedCode MapPatchedCode(const uint8_t (&blob)[N], bool emulate_amd) {
 using PatchCounts = Loader::InstructionPatchCounts Loader::GuestInstructionPatchResult::*;
 
 // Runs the blob through the SIGILL emulator (reference) and through the patched copy, which must
-// produce the same bytes. EXTRQ becomes a native trampoline without a single SIGILL. INSERTQ is
-// marked as a trap by the patcher and keeps going through the signal emulator.
+// produce the same bytes. EXTRQ and INSERTQ become native trampolines without a single SIGILL.
 template <typename Fn, size_t N, typename Invoke>
 void CheckPatchedMatchesEmulator(const uint8_t (&blob)[N], PatchCounts counts, bool native,
                                  Invoke invoke, const char *text) {
@@ -380,7 +379,7 @@ void TestPatchedExtrqRexHigh() {
 
 void TestPatchedInsertqImmediate() {
 	CheckPatchedMatchesEmulator<BlobFn>(
-	    kInsertqXmm2Xmm0Len32Index0, &Loader::GuestInstructionPatchResult::insertq, false,
+	    kInsertqXmm2Xmm0Len32Index0, &Loader::GuestInstructionPatchResult::insertq, true,
 	    [](BlobFn fn, uint64_t *out) {
 		    fn(out, std::bit_cast<double>(0x1122334455667788ull), 0.0,
 		       std::bit_cast<double>(0x0123456789abcdefull));
@@ -390,7 +389,7 @@ void TestPatchedInsertqImmediate() {
 
 void TestPatchedInsertqIndexedRexHigh() {
 	CheckPatchedMatchesEmulator<PairBlobFn>(
-	    kInsertqXmm10Xmm9Len16Index8, &Loader::GuestInstructionPatchResult::insertq, false,
+	    kInsertqXmm10Xmm9Len16Index8, &Loader::GuestInstructionPatchResult::insertq, true,
 	    [](PairBlobFn fn, uint64_t *out) {
 		    const uint64_t src[2] {0x8877665544332211ull, 0xdeadbeefcafebabeull};
 		    const uint64_t dest[2] {0xaaaaaaaaaaaaaaaaull, 0xbbbbbbbbbbbbbbbbull};
@@ -401,13 +400,52 @@ void TestPatchedInsertqIndexedRexHigh() {
 
 void TestPatchedInsertqRegister() {
 	CheckPatchedMatchesEmulator<PairBlobFn>(
-	    kInsertqXmm10Xmm9, &Loader::GuestInstructionPatchResult::insertq, false,
+	    kInsertqXmm10Xmm9, &Loader::GuestInstructionPatchResult::insertq, true,
 	    [](PairBlobFn fn, uint64_t *out) {
 		    const uint64_t src[2] {0x0123456789abcdefull, 0xdeadbeef0000c4c8ull};
 		    const uint64_t dest[2] {0x8877665544332211ull, 0xfedcba9876543210ull};
 		    fn(out, src, dest);
 	    },
 	    "register INSERTQ found by the patcher");
+}
+
+// Every length/index pair, including a zero length (64 bits) and fields running past bit 63, gives
+// the emulator's result through the native trampoline. Register controls also carry ignored bits.
+void TestPatchedInsertqSweep() {
+	constexpr uint32_t kLengths[] {0, 1, 7, 8, 16, 31, 32, 33, 56, 63};
+	constexpr uint32_t kIndices[] {0, 1, 8, 31, 32, 56, 63};
+	for (const uint32_t length: kLengths) {
+		for (const uint32_t index: kIndices) {
+			const uint64_t controls = 0xdeadbeef0000c0c0ull | length | (uint64_t {index} << 8u);
+			CheckPatchedMatchesEmulator<PairBlobFn>(
+			    kInsertqXmm10Xmm9, &Loader::GuestInstructionPatchResult::insertq, true,
+			    [controls](PairBlobFn fn, uint64_t *out) {
+				    const uint64_t src[2] {0x9e3779b97f4a7c15ull, controls};
+				    const uint64_t dest[2] {0x0123456789abcdefull, 0xfedcba9876543210ull};
+				    fn(out, src, dest);
+			    },
+			    "register INSERTQ sweep matches the emulator");
+			CheckPatchedMatchesEmulator<PairBlobFn>(
+			    kInsertqXmm9Xmm9, &Loader::GuestInstructionPatchResult::insertq, true,
+			    [controls](PairBlobFn fn, uint64_t *out) {
+				    const uint64_t src[2] {0x9e3779b97f4a7c15ull, controls};
+				    fn(out, src, nullptr);
+			    },
+			    "aliased register INSERTQ sweep matches the emulator");
+			uint8_t blob[sizeof(kInsertqXmm10Xmm9Len16Index8)];
+			std::memcpy(blob, kInsertqXmm10Xmm9Len16Index8, sizeof(blob));
+			blob[15] = static_cast<uint8_t>(length);
+			blob[16] = static_cast<uint8_t>(index);
+			CheckPatchedMatchesEmulator<PairBlobFn>(
+			    blob, &Loader::GuestInstructionPatchResult::insertq, true,
+			    [](PairBlobFn fn, uint64_t *out) {
+				    const uint64_t src[2] {0x9e3779b97f4a7c15ull, 0x5555555555555555ull};
+				    const uint64_t dest[2] {0x0123456789abcdefull, 0xfedcba9876543210ull};
+				    fn(out, src, dest);
+			    },
+			    "immediate INSERTQ sweep matches the emulator");
+		}
+	}
 }
 
 // The ordinary VEX.128 VRSQRTPS must be found by the patcher and give the reference result, either
@@ -482,6 +520,7 @@ int main() {
 	TestPatchedInsertqImmediate();
 	TestPatchedInsertqIndexedRexHigh();
 	TestPatchedInsertqRegister();
+	TestPatchedInsertqSweep();
 	TestPatchedReciprocalSquareRoot();
 	std::printf("macosSse4aTests: all passed\n");
 	return 0;
